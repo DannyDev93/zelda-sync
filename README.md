@@ -22,6 +22,13 @@ curl -fsSL https://raw.githubusercontent.com/DannyDev93/zelda-sync/main/zsync | 
 
 Only real save files are synced: no settings and no save states.
 
+## What you see
+
+Before changing anything it shows, for each game, what will be uploaded or downloaded: the files with their
+sizes and dates, where they come from and where they go, and which current save gets backed up first. It then
+asks `Go ahead? [y = yes / Enter = cancel]`. Afterwards it prints a summary: what was backed up, where it is now,
+the version dates, and where any replaced save was kept.
+
 ## How it decides
 
 For each game it compares this device, the cloud, and what this device had at its last sync:
@@ -41,6 +48,7 @@ Local backups: `~/.local/share/zelda-sync/backups/` (the newest 20 per game). Th
 
 - `--dry-run` shows what would happen and changes nothing
 - `--pick-again` forgets the remembered save locations and asks again
+- `--yes` skips the confirmation question (for unattended use)
 
 The GitHub token is read from `~/Games/Zelda/.sync/token` or `~/.config/zelda-sync/token`; on a new device it
 asks for it once.

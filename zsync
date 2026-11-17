@@ -7,6 +7,7 @@
 # Options:
 #   --dry-run       show what would happen, change nothing
 #   --pick-again    forget remembered save locations and choose again
+#   --yes           don't ask for confirmation (for unattended use)
 #   --help
 #
 # Games: Skyward Sword HD (Sky Recomp), Ocarina of Time (Ship of Harkinian), Majora's Mask
@@ -25,7 +26,7 @@ set -u -o pipefail
 
 OWNER="DannyDev93"
 SAVES_REPO="zelda-saves"
-VERSION="1.0"
+VERSION="1.1"
 
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/zelda-sync"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zelda-sync"
@@ -43,6 +44,7 @@ DEVICE="${ZSYNC_DEVICE:-$DEVICE}"
 REMOTE="https://github.com/$OWNER/$SAVES_REPO.git"
 TEST_REMOTE="${ZSYNC_TEST_REMOTE:-}"   # for testing only: a local git repo used instead of GitHub
 DRY=0
+YES=0
 PICK_AGAIN=0
 
 # ---------- output ----------
@@ -50,7 +52,7 @@ if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; C=$'\e[36m'
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
 warn() { printf '  %s⚠ %s%s\n' "$Y" "$*" "$N"; }
-skip() { warn "$@"; SKIPPED=$((SKIPPED+1)); }   # warn + count it, so the summary never says "all good" falsely
+skip() { warn "$@"; SKIPPED=$((SKIPPED+1)); [ -n "${id-}" ] && REASON[$id]="$*"; true; }   # warn + count it, so the summary never says "all good" falsely
 err()  { printf '  %s✗ %s%s\n' "$R" "$*" "$N"; }
 act()  { printf '  %s→%s %s\n' "$C" "$N" "$*"; }
 die()  { printf '\n%s✗ %s%s\n\nNothing was changed.\n' "$R" "$*" "$N" >&2; exit 1; }
@@ -118,6 +120,7 @@ backup_local() { # backup_local game root pattern -> prints the backup file
 for a in "$@"; do case "$a" in
 	--dry-run|-n) DRY=1 ;;
 	--pick-again) PICK_AGAIN=1 ;;
+	--yes|-y) YES=1 ;;
 	-h|--help) sed -n '2,24p' "$0" 2>/dev/null || say "zsync: --dry-run, --pick-again"; exit 0 ;;
 	*) die "Unknown option: $a (use --dry-run or --pick-again)" ;;
 esac; done
@@ -195,7 +198,7 @@ FOUND=$(find "${ROOTS[@]}" \
 	   -o -path '*/romfs' -o -path '*/exefs' \) -prune \
 	-o -type f \( -false "${NAMES[@]}" \) -print 2>/dev/null | sort -u)
 
-declare -A ROOT=()
+declare -A ROOT=() REASON=()
 NFOUND=0; SKIPPED=0
 for gm in "${GAMES[@]}"; do
 	id=$(field "$gm" 1); name=$(field "$gm" 2); sig=$(field "$gm" 3); mode=$(field "$gm" 4); pat=$(field "$gm" 5)
@@ -235,23 +238,42 @@ done
 [ $NFOUND -gt 0 ] || die "No save files found for any of the games on this device. Play one and save first."
 
 # ---------- decide ----------
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "${1}B"; }
+list_files() { # list_files dir pattern [nodate] : files with size (and date), at most 12 lines
+	local d="$1" p="$2" nodate="${3-}" n
+	n=$(count_files "$d" "$p")
+	(cd "$d" && find . -type f -name "$p" ! -name '.*' -printf '%P\t%s\t%TY-%Tm-%Td %TH:%TM\n' | sort) | head -12 |
+	while IFS=$'\t' read -r f s t; do
+		if [ -n "$nodate" ]; then printf '          %-34s %8s\n' "$f" "$(human "$s")"
+		else printf '          %-34s %8s   %s\n' "$f" "$(human "$s")" "$t"; fi
+	done
+	[ "$n" -gt 12 ] && printf '          … and %d more files\n' $((n-12))
+	true
+}
+cloud_info() { # "saved <date> on <device>" for the cloud version, or ""
+	local f="$REPO/games/$1.info"
+	[ -f "$f" ] && printf 'saved %s on %s' "$(sed -n 's/^saved=//p' "$f")" "$(sed -n 's/^device=//p' "$f")"
+}
+gname() { local gm; for gm in "${GAMES[@]}"; do [ "$(field "$gm" 1)" = "$1" ] && { name=$(field "$gm" 2); pat=$(field "$gm" 5); }; done; }
+
 say ""
 say "Comparing with the cloud…"
-UPLOAD=(); DOWNLOAD=()
+UPLOAD=(); DOWNLOAD=(); declare -A UPTODATE=()
 PROCS=$(running_programs)
 for gm in "${GAMES[@]}"; do
 	id=$(field "$gm" 1); name=$(field "$gm" 2); pat=$(field "$gm" 5); procs=$(field "$gm" 6)
 	[ -n "${ROOT[$id]-}" ] || continue
 	root="${ROOT[$id]}"; cdir="$REPO/games/$id"
 	L=$(hash_dir "$root" "$pat"); Cl=$(hash_dir "$cdir" "$pat"); Bs=$(state_get "$id")
-	cinfo=""; [ -f "$REPO/games/$id.info" ] && cinfo=$(sed -n 's/^saved=//p' "$REPO/games/$id.info")" on "$(sed -n 's/^device=//p' "$REPO/games/$id.info")
+	cinfo=$(cloud_info "$id")
 
 	if grep -qE "$procs" <<< "$PROCS"; then skip "$name is running right now — close it first. Skipped."; continue; fi
 	if [ "$(size_kb "$root")" -gt 102400 ]; then skip "$name: save folder is over 100 MB, that's not normal. Skipped."; continue; fi
 
 	if [ "$L" = "$Cl" ]; then
 		[ "$L" = none ] && { skip "$name: no saves here or in the cloud yet."; continue; }
-		ok "$name: up to date"; [ $DRY = 1 ] || state_set "$id" "$L"; continue
+		ok "$name: up to date"; UPTODATE[$id]="${cinfo:-same on both}"
+		[ $DRY = 1 ] || state_set "$id" "$L"; continue
 	fi
 	if [ "$L" = none ]; then decision=down
 	elif [ "$Cl" = none ]; then decision=up
@@ -259,32 +281,76 @@ for gm in "${GAMES[@]}"; do
 	elif [ "$Bs" = "$L" ]; then decision=down
 	else
 		warn "$name: changed both here and in the cloud since the last sync on this device."
-		printf '      this device: last saved %s\n      cloud:       last saved %s\n' "$(newest "$root" "$pat")" "${cinfo:-unknown}"
+		printf '      this device: last saved %s\n      cloud:       %s\n' "$(newest "$root" "$pat")" "${cinfo:-unknown}"
 		if ask "      Keep which one? [h = this device / c = cloud / Enter = skip]: "; then
-			case "$REPLY" in h|H) decision=up ;; c|C) decision=down ;; *) skip "$name: skipped."; continue ;; esac
+			case "$REPLY" in h|H) decision=up ;; c|C) decision=down ;; *) skip "$name: skipped (you chose to skip it)."; continue ;; esac
 		else skip "$name: skipped (needs a decision; run zsync in a terminal)."; continue; fi
 	fi
-	if [ "$decision" = up ]; then act "$name: this device is newer ($(newest "$root" "$pat")) → upload to cloud"; UPLOAD+=("$id")
-	else act "$name: cloud is newer (${cinfo:-unknown}) → download to this device"; DOWNLOAD+=("$id"); fi
+	if [ "$decision" = up ]; then act "$name: this device is newer → upload"; UPLOAD+=("$id")
+	else act "$name: cloud is newer → download"; DOWNLOAD+=("$id"); fi
 done
 
-SKIPNOTE=""; [ $SKIPPED -gt 0 ] && SKIPNOTE=" ${Y}${B}$SKIPPED game(s) were skipped — see the ⚠ lines above.${N}"
-if [ $DRY = 1 ]; then say ""; say "${Y}Dry run: nothing was changed.${N}$SKIPNOTE"; exit 0; fi
+# ---------- show the plan ----------
+SKIPNOTE=""; [ $SKIPPED -gt 0 ] && SKIPNOTE=" ${Y}${B}$SKIPPED game(s) skipped — see the ⚠ lines above.${N}"
 if [ ${#UPLOAD[@]} -eq 0 ] && [ ${#DOWNLOAD[@]} -eq 0 ]; then
 	say ""
-	if [ $SKIPPED -eq 0 ]; then say "${G}${B}Everything is in sync.${N}"; exit 0
-	else say "Nothing was transferred.$SKIPNOTE"; exit 2; fi
+	[ $DRY = 1 ] && say "${Y}Dry run.${N}"
+	if [ $SKIPPED -eq 0 ]; then say "${G}${B}Everything is in sync. Nothing to back up.${N}"; exit 0
+	else say "Nothing to transfer.$SKIPNOTE"; exit 2; fi
 fi
 
-# ---------- downloads (cloud -> this device) ----------
-FAILED=0
+say ""
+say "${B}══════════ What will be backed up ══════════${N}"
+for id in "${UPLOAD[@]-}"; do
+	[ -n "$id" ] || continue; gname "$id"; root="${ROOT[$id]}"; cinfo=$(cloud_info "$id")
+	say ""
+	say "  ${B}$name${N}"
+	say "    ${C}↑ UPLOAD${N}  this device ($DEVICE)  →  cloud (GitHub $OWNER/$SAVES_REPO)"
+	say "    from: $root"
+	list_files "$root" "$pat"
+	if [ -n "$cinfo" ]; then say "    replaces the cloud version ($cinfo) — that one stays in the cloud history"
+	else say "    the cloud has no save for this game yet"; fi
+done
 for id in "${DOWNLOAD[@]-}"; do
-	[ -n "$id" ] || continue
-	for gm in "${GAMES[@]}"; do [ "$(field "$gm" 1)" = "$id" ] && { name=$(field "$gm" 2); pat=$(field "$gm" 5); }; done
-	root="${ROOT[$id]}"; cdir="$REPO/games/$id"; want=$(hash_dir "$cdir" "$pat")
-	bk=""
+	[ -n "$id" ] || continue; gname "$id"; root="${ROOT[$id]}"; cdir="$REPO/games/$id"
+	say ""
+	say "  ${B}$name${N}"
+	say "    ${C}↓ DOWNLOAD${N}  cloud ($(cloud_info "$id"))  →  this device ($DEVICE)"
+	say "    files:"
+	list_files "$cdir" "$pat" nodate
+	say "    to:   $root"
 	if [ "$(count_files "$root" "$pat")" -gt 0 ]; then
-		bk=$(backup_local "$id" "$root" "$pat") || { err "$name: couldn't back up the current save, so I didn't touch it."; FAILED=1; continue; }
+		say "    your current save here (last saved $(newest "$root" "$pat"), $(count_files "$root" "$pat") files) is backed up first to:"
+		say "          $BACKUPS/$id/"
+	fi
+done
+if [ ${#UPTODATE[@]} -gt 0 ]; then
+	say ""; printf '  Already in sync, not touched: '
+	first=1; for id in "${!UPTODATE[@]}"; do gname "$id"; [ $first = 1 ] || printf ', '; printf '%s' "$name"; first=0; done; echo
+fi
+[ $SKIPPED -gt 0 ] && { say ""; say "  ${Y}Skipped: $SKIPPED game(s) — see the ⚠ lines above.${N}"; }
+say ""
+say "${B}════════════════════════════════════════════${N}"
+
+if [ $DRY = 1 ]; then say "${Y}Dry run: nothing was changed.${N}"; exit 0; fi
+if [ $YES = 0 ]; then
+	if ask "Go ahead? [y = yes / Enter = cancel]: "; then
+		case "$REPLY" in y|Y|yes|YES|Yes) ;; *) say "Cancelled. Nothing was changed."; exit 0 ;; esac
+	else
+		say "No terminal to confirm on, so nothing was changed. (Use --yes to run without asking.)"; exit 3
+	fi
+fi
+say ""
+
+# ---------- downloads (cloud -> this device) ----------
+FAILED=0; declare -A RESULT=()
+for id in "${DOWNLOAD[@]-}"; do
+	[ -n "$id" ] || continue; gname "$id"
+	root="${ROOT[$id]}"; cdir="$REPO/games/$id"; want=$(hash_dir "$cdir" "$pat"); cinfo=$(cloud_info "$id")
+	bk=""; oldwhen=""
+	if [ "$(count_files "$root" "$pat")" -gt 0 ]; then
+		oldwhen=$(newest "$root" "$pat")
+		bk=$(backup_local "$id" "$root" "$pat") || { err "$name: couldn't back up the current save, so I didn't touch it."; RESULT[$id]="FAIL|couldn't make the safety backup, nothing changed"; FAILED=1; continue; }
 	fi
 	# replace only the save files: remove local ones the cloud doesn't have, copy the cloud's in
 	(cd "$root" && find . -type f -name "$pat" ! -name '.*' -print0) | while IFS= read -r -d '' f; do
@@ -293,37 +359,64 @@ for id in "${DOWNLOAD[@]-}"; do
 	(cd "$cdir" && find . -type f -name "$pat" ! -name '.*' -print0 | tar --null -cf - -T -) | (cd "$root" && tar -xpf -)
 	sync -f "$root" 2>/dev/null || sync
 	if [ "$(hash_dir "$root" "$pat")" = "$want" ]; then
-		state_set "$id" "$want"; ok "$name: downloaded${bk:+ (old save backed up: $bk)}"
+		state_set "$id" "$want"; ok "$name: downloaded"
+		RESULT[$id]="DOWN|$(count_files "$root" "$pat")|$cinfo|$root|$bk|$oldwhen"
 	else
 		err "$name: download didn't check out — putting the old save back."
 		[ -n "$bk" ] && (cd "$root" && tar -xzf "$bk")
-		FAILED=1
+		RESULT[$id]="FAIL|download didn't check out, your old save was put back"; FAILED=1
 	fi
 done
 
 # ---------- uploads (this device -> cloud) ----------
+COMMIT=""
 if [ ${#UPLOAD[@]} -gt 0 ]; then
 	for id in "${UPLOAD[@]}"; do
-		for gm in "${GAMES[@]}"; do [ "$(field "$gm" 1)" = "$id" ] && { name=$(field "$gm" 2); pat=$(field "$gm" 5); }; done
-		root="${ROOT[$id]}"; cdir="$REPO/games/$id"
+		gname "$id"; root="${ROOT[$id]}"; cdir="$REPO/games/$id"
 		rm -rf "$cdir"; mkdir -p "$cdir"
 		(cd "$root" && find . -type f -name "$pat" ! -name '.*' -print0 | tar --null -cf - -T -) | (cd "$cdir" && tar -xf -)
 		printf 'game=%s\nsaved=%s\ndevice=%s\nhash=%s\n' "$name" "$(newest "$root" "$pat")" "$DEVICE" "$(hash_dir "$cdir" "$pat")" > "$REPO/games/$id.info"
 	done
 	g add -A games >/dev/null 2>&1
 	if g commit -q -m "$(printf 'Sync from %s: %s' "$DEVICE" "${UPLOAD[*]}")" && g push -q origin main 2>/dev/null; then
+		COMMIT=$(g rev-parse HEAD 2>/dev/null)
 		for id in "${UPLOAD[@]}"; do
-			for gm in "${GAMES[@]}"; do [ "$(field "$gm" 1)" = "$id" ] && { name=$(field "$gm" 2); pat=$(field "$gm" 5); }; done
-			state_set "$id" "$(hash_dir "$REPO/games/$id" "$pat")"; ok "$name: uploaded"
+			gname "$id"; state_set "$id" "$(hash_dir "$REPO/games/$id" "$pat")"; ok "$name: uploaded"
+			RESULT[$id]="UP|$(count_files "${ROOT[$id]}" "$pat")|$(cloud_info "$id")|${ROOT[$id]}"
 		done
 	else
 		err "Upload failed (the cloud may have changed during this sync, or the connection dropped)."
 		err "Your saves on this device are untouched. Just run zsync again."
+		for id in "${UPLOAD[@]}"; do RESULT[$id]="FAIL|upload failed, nothing changed on this device or in the cloud"; done
 		rm -rf "$REPO"; FAILED=1   # it's only a cache of the cloud; it is downloaded fresh next run
 	fi
 fi
 
+# ---------- summary ----------
 say ""
-if [ $FAILED = 1 ]; then say "${Y}${B}Sync finished with problems — see above. Nothing was lost.${N}$SKIPNOTE"; exit 1
-elif [ $SKIPPED -gt 0 ]; then say "${G}${B}Sync complete for the rest.${N}$SKIPNOTE"; exit 2
-else say "${G}${B}Sync complete.${N}"; fi
+say "${B}══════════ Summary — $(date '+%Y-%m-%d %H:%M') on $DEVICE ══════════${N}"
+for gm in "${GAMES[@]}"; do
+	id=$(field "$gm" 1); name=$(field "$gm" 2)
+	if [ -n "${RESULT[$id]-}" ]; then
+		IFS='|' read -r kind a b c d e <<< "${RESULT[$id]}"
+		case "$kind" in
+		UP)   say "  ${G}✓${N} ${B}$name${N} — backed up to the cloud"
+		      say "      $a file(s) from $c"
+		      say "      cloud copy: $b   (GitHub $OWNER/$SAVES_REPO)"
+		      [ -n "$COMMIT" ] && [ -z "$TEST_REMOTE" ] && say "      history: https://github.com/$OWNER/$SAVES_REPO/commit/${COMMIT:0:12}" ;;
+		DOWN) say "  ${G}✓${N} ${B}$name${N} — restored from the cloud"
+		      say "      $a file(s), version $b"
+		      say "      into: $c"
+		      [ -n "$d" ] && say "      your previous save (last saved $e) is kept in: $d" ;;
+		FAIL) say "  ${R}✗${N} ${B}$name${N} — $a" ;;
+		esac
+	elif [ -n "${UPTODATE[$id]-}" ]; then
+		say "  · $name — already in sync (${UPTODATE[$id]})"
+	elif [ -n "${REASON[$id]-}" ]; then
+		say "  ${Y}⚠${N} $name — ${REASON[$id]#"$name"}"
+	fi
+done
+say ""
+if [ $FAILED = 1 ]; then say "${Y}${B}Finished with problems — see above. Nothing was lost.${N}"; exit 1
+elif [ $SKIPPED -gt 0 ]; then say "${G}${B}Done for the rest.${N}$SKIPNOTE"; exit 2
+else say "${G}${B}All done.${N}"; fi
