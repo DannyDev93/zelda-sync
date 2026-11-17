@@ -242,7 +242,10 @@ human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "${1}B"; }
 list_files() { # list_files dir pattern [nodate] : files with size (and date), at most 12 lines
 	local d="$1" p="$2" nodate="${3-}" n
 	n=$(count_files "$d" "$p")
-	(cd "$d" && find . -type f -name "$p" ! -name '.*' -printf '%P\t%s\t%TY-%Tm-%Td %TH:%TM\n' | sort) | head -12 |
+	# the game's main save file first, then the rest alphabetically
+	(cd "$d" && find . -type f -name "$p" ! -name '.*' -printf '%P\t%s\t%TY-%Tm-%Td %TH:%TM\n' | sort |
+		awk -F'\t' -v s="${sig:-}" 'BEGIN{n=split(s,a,"")} { f=$1; sub(/.*\//,"",f); if (s!="" && f ~ glob(s)) print; else rest[++r]=$0 } END{for(i=1;i<=r;i++) print rest[i]}
+		function glob(g,  r){ r=g; gsub(/\./,"\\.",r); gsub(/\*/,".*",r); gsub(/\?/,".",r); return "^" r "$" }') | head -12 |
 	while IFS=$'\t' read -r f s t; do
 		if [ -n "$nodate" ]; then printf '          %-34s %8s\n' "$f" "$(human "$s")"
 		else printf '          %-34s %8s   %s\n' "$f" "$(human "$s")" "$t"; fi
@@ -254,7 +257,7 @@ cloud_info() { # "saved <date> on <device>" for the cloud version, or ""
 	local f="$REPO/games/$1.info"
 	[ -f "$f" ] && printf 'saved %s on %s' "$(sed -n 's/^saved=//p' "$f")" "$(sed -n 's/^device=//p' "$f")"
 }
-gname() { local gm; for gm in "${GAMES[@]}"; do [ "$(field "$gm" 1)" = "$1" ] && { name=$(field "$gm" 2); pat=$(field "$gm" 5); }; done; }
+gname() { local gm; for gm in "${GAMES[@]}"; do [ "$(field "$gm" 1)" = "$1" ] && { name=$(field "$gm" 2); pat=$(field "$gm" 5); sig=$(field "$gm" 3); }; done; }
 
 say ""
 say "Comparing with the cloud…"
