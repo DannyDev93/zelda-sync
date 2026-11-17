@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# zsync — keep Zelda save files in sync between devices through a private GitHub repo.
+#
+#   curl -fsSL https://raw.githubusercontent.com/DannyDev93/zelda-sync/main/zsync | bash
+#   curl -fsSL https://raw.githubusercontent.com/DannyDev93/zelda-sync/main/zsync | bash -s -- --dry-run
+#
+# Options:
+#   --dry-run       show what would happen, change nothing
+#   --pick-again    forget remembered save locations and choose again
+#   --help
+#
+# Games: Skyward Sword HD (Sky Recomp), Ocarina of Time (Ship of Harkinian), Majora's Mask
+# (Zelda64Recompiled), Twilight Princess (Dusklight), Wind Waker HD (ZeldaWWHDRecomp).
+# Only real save files are synced: no settings, no save states.
+#
+# Safety rules:
+#   - nothing is ever deleted without a backup (local backups + full history in the cloud repo)
+#   - a game that is running is skipped
+#   - a game whose saves are not found is skipped with a warning
+#   - if both this device and the cloud changed since the last sync, you are asked; without a
+#     terminal to ask on, that game is skipped
+#   - any network or GitHub problem stops before anything is changed
+
+set -u -o pipefail
+
+OWNER="DannyDev93"
+SAVES_REPO="zelda-saves"
+VERSION="1.0"
+
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/zelda-sync"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zelda-sync"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/zelda-sync"
+REPO="$DATA/repo"
+BACKUPS="$DATA/backups"
+STATE="$STATE_DIR/state"
+PATHS="$CONF_DIR/paths"
+PRODUCT=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null | tr -d '\n')
+case "$PRODUCT" in
+	Jupiter|Galileo) DEVICE="Steam Deck" ;;
+	*) DEVICE=$(hostnamectl --static 2>/dev/null); [ -n "$DEVICE" ] || DEVICE="${PRODUCT:-$(hostname 2>/dev/null || echo PC)}" ;;
+esac
+DEVICE="${ZSYNC_DEVICE:-$DEVICE}"
+REMOTE="https://github.com/$OWNER/$SAVES_REPO.git"
+TEST_REMOTE="${ZSYNC_TEST_REMOTE:-}"   # for testing only: a local git repo used instead of GitHub
+DRY=0
+PICK_AGAIN=0
+
+# ---------- output ----------
+if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; C=$'\e[36m'; N=$'\e[0m'; else B= G= Y= R= C= N=; fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '  %s⚠ %s%s\n' "$Y" "$*" "$N"; }
+skip() { warn "$@"; SKIPPED=$((SKIPPED+1)); }   # warn + count it, so the summary never says "all good" falsely
+err()  { printf '  %s✗ %s%s\n' "$R" "$*" "$N"; }
+act()  { printf '  %s→%s %s\n' "$C" "$N" "$*"; }
+die()  { printf '\n%s✗ %s%s\n\nNothing was changed.\n' "$R" "$*" "$N" >&2; exit 1; }
+
+# Ask on the terminal even when the script itself arrives through a pipe (curl | bash).
+HAS_TTY=0; { exec 3<>/dev/tty; } 2>/dev/null && HAS_TTY=1
+ask() { # ask "question" -> reply in $REPLY ; returns 1 when there is no terminal
+	[ $HAS_TTY = 1 ] || return 1
+	printf '%s' "$1" >&3; IFS= read -r REPLY <&3 || return 1; return 0
+}
+
+# ---------- games ----------
+# id | name | signature file (find -name) | how to get the save root from it | files to sync (find -name) | process regex
+GAMES=(
+"ss;Skyward Sword HD;wiiking2.sav;slotparent;*;^(skyrecomp|sky.?recomp.*\\.appimage)$"
+"soh;Ocarina of Time (Ship of Harkinian);global.sav;dir;*;^(soh\\.elf|soh|soh.*\\.appimage)$"
+"mm;Majora's Mask (Zelda64Recompiled);mm.n64.*.bin;dir;*;^zelda64recomp"
+"tp;Twilight Princess (Dusklight);*-GZ2?-gczelda2.gci;dir;*gczelda2*.gci;^(dusklight|dusklight.*\\.appimage)$"
+"ww;Wind Waker HD (ZeldaWWHDRecomp);cking.sav;dir;*;^(wind-waker-hd|wwhd|windwakerhd.*\\.appimage)$"
+)
+# Names of running programs only (program file names, never their arguments), lower-case, one per line.
+running_programs() {
+	local p a e
+	for p in /proc/[0-9]*; do
+		a=$(tr '\0' '\n' < "$p/cmdline" 2>/dev/null | head -1); a=${a##*/}
+		e=$(readlink "$p/exe" 2>/dev/null); e=${e##*/}
+		printf '%s\n%s\n' "$a" "$e"
+	done | tr '[:upper:]' '[:lower:]' | sed '/^$/d' | sort -u
+}
+field() { local IFS=';' F; read -r -a F <<< "$1"; printf '%s' "${F[$(( $2 - 1 ))]}"; }   # no glob expansion
+
+# ---------- helpers ----------
+need() { command -v "$1" >/dev/null 2>&1 || die "This needs '$1', which isn't installed."; }
+
+hash_dir() { # hash_dir dir pattern -> prints hash, or "none" when there are no files
+	local d="$1" p="$2" list
+	[ -d "$d" ] || { echo none; return; }
+	list=$(cd "$d" && find . -type f -name "$p" ! -name '.*' -print0 | sort -z | xargs -0r sha256sum)
+	[ -n "$list" ] && printf '%s' "$list" | sha256sum | cut -c1-16 || echo none
+}
+count_files() { find "$1" -type f -name "$2" ! -name '.*' 2>/dev/null | wc -l; }
+newest() { # newest modification time of the save files, human readable
+	local t; t=$(find "$1" -type f -name "$2" ! -name '.*' -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+	[ -n "$t" ] && date -d "@${t%.*}" '+%Y-%m-%d %H:%M' || echo "-"
+}
+size_kb() { du -sk "$1" 2>/dev/null | cut -f1; }
+
+state_get() { [ -f "$STATE" ] && grep -m1 "^$1=" "$STATE" | cut -d= -f2-; true; }
+state_set() { mkdir -p "$STATE_DIR"; { grep -v "^$1=" "$STATE" 2>/dev/null; echo "$1=$2"; } > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"; }
+path_get()  { [ -f "$PATHS" ] && grep -m1 "^$1=" "$PATHS" | cut -d= -f2-; true; }
+path_set()  { mkdir -p "$CONF_DIR"; { grep -v "^$1=" "$PATHS" 2>/dev/null; echo "$1=$2"; } > "$PATHS.tmp" && mv "$PATHS.tmp" "$PATHS"; }
+
+g() { git -C "$REPO" -c http.extraHeader="Authorization: Basic $AUTH" -c user.name="zelda-sync ($DEVICE)" \
+	-c user.email="zelda-sync@users.noreply.github.com" -c advice.detachedHead=false "$@"; }
+
+backup_local() { # backup_local game root pattern -> prints the backup file
+	local id="$1" root="$2" p="$3" f; mkdir -p "$BACKUPS/$id"
+	f="$BACKUPS/$id/$(date '+%Y%m%d-%H%M%S').tar.gz"
+	(cd "$root" && find . -type f -name "$p" ! -name '.*' -print0 | tar --null -czf "$f" -T -) || return 1
+	ls -1t "$BACKUPS/$id"/*.tar.gz 2>/dev/null | tail -n +21 | xargs -r rm -f   # keep the newest 20
+	echo "$f"
+}
+
+# ---------- arguments ----------
+for a in "$@"; do case "$a" in
+	--dry-run|-n) DRY=1 ;;
+	--pick-again) PICK_AGAIN=1 ;;
+	-h|--help) sed -n '2,24p' "$0" 2>/dev/null || say "zsync: --dry-run, --pick-again"; exit 0 ;;
+	*) die "Unknown option: $a (use --dry-run or --pick-again)" ;;
+esac; done
+
+say "${B}Zelda save sync $VERSION${N} — device: ${B}$DEVICE${N}$([ $DRY = 1 ] && printf ' — %sDRY RUN, nothing will be changed%s' "$Y" "$N")"
+say ""
+for t in git sha256sum find sort xargs tar curl date du; do need "$t"; done
+
+# one run at a time
+mkdir -p "$STATE_DIR" "$DATA" "$CONF_DIR" || die "Can't create my folders in $HOME."
+if command -v flock >/dev/null 2>&1; then
+	exec 9>"$STATE_DIR/lock"; flock -n 9 || die "zsync is already running in another window."
+fi
+
+# ---------- token ----------
+TOKEN=""
+for f in "$HOME/Games/Zelda/.sync/token" "$CONF_DIR/token"; do
+	[ -s "$f" ] && { TOKEN=$(tr -d '[:space:]' < "$f"); TOKEN_FILE="$f"; break; }
+done
+if [ -z "$TOKEN" ]; then
+	say "No GitHub token on this device yet."
+	[ $HAS_TTY = 1 ] || die "No token found, and no terminal to ask for it. Put it in ~/.config/zelda-sync/token"
+	printf 'Paste your token (github_pat_…, it stays hidden) and press Enter: ' >&3
+	stty -echo <&3 2>/dev/null; IFS= read -r TOKEN <&3; stty echo <&3 2>/dev/null; printf '\n' >&3
+	TOKEN=$(printf '%s' "$TOKEN" | tr -d '[:space:]')
+	[ -n "$TOKEN" ] || die "No token entered."
+	TOKEN_FILE="$CONF_DIR/token"
+	(umask 077; printf '%s\n' "$TOKEN" > "$TOKEN_FILE") || die "Couldn't save the token."
+	ok "token saved in $TOKEN_FILE (only you can read it)"
+fi
+AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
+export GIT_TERMINAL_PROMPT=0
+
+# ---------- cloud check (before touching anything) ----------
+if [ -n "$TEST_REMOTE" ]; then REMOTE="$TEST_REMOTE"; code=200; else
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -H "Authorization: Bearer $TOKEN" \
+	"https://api.github.com/repos/$OWNER/$SAVES_REPO") || code=000; fi
+case "$code" in
+	200) ;;
+	000) die "Can't reach GitHub. Check the internet connection." ;;
+	401) die "GitHub refused the token (expired or wrong). Make a new one and put it in $TOKEN_FILE" ;;
+	403|404) die "The token can't see $OWNER/$SAVES_REPO. Check the token's repository access." ;;
+	*) die "GitHub answered with an error ($code). Try again in a minute." ;;
+esac
+
+if [ ! -d "$REPO/.git" ]; then
+	rm -rf "$REPO"; mkdir -p "$REPO"
+	git -C "$REPO" init -q -b main 2>/dev/null || { git -C "$REPO" init -q && git -C "$REPO" checkout -q -b main; }
+	g remote add origin "$REMOTE"
+fi
+g remote set-url origin "$REMOTE"
+g fetch -q origin 2>/dev/null || die "Couldn't download from the cloud (git fetch failed)."
+if g rev-parse -q --verify origin/main >/dev/null; then
+	g checkout -q -B main origin/main && g reset -q --hard origin/main && g clean -qfdx || die "Couldn't prepare the cloud copy."
+	CLOUD_EMPTY=0
+else
+	CLOUD_EMPTY=1   # brand new repo
+fi
+ok "connected to the cloud ($([ -n "$TEST_REMOTE" ] && echo "TEST: $TEST_REMOTE" || echo "$OWNER/$SAVES_REPO"))"
+
+# ---------- search for save files ----------
+say ""
+say "Looking for save files…"
+ROOTS=("$HOME")
+for m in /run/media/*/* /run/media/* /media/* /mnt/*; do
+	[ -d "$m" ] && [ -r "$m" ] && case "$m" in "$HOME"*) ;; *) ROOTS+=("$m") ;; esac
+done
+NAMES=()
+for gm in "${GAMES[@]}"; do NAMES+=(-o -name "$(field "$gm" 3)"); done
+FOUND=$(find "${ROOTS[@]}" \
+	\( -path "$DATA" -o -path "$HOME/Games/Zelda/_work" -o -path "$HOME/Games/Zelda/.sync" \
+	   -o -path '*/.cache' -o -path '*/steamapps/common' -o -path '*/steamapps/shadercache' \
+	   -o -path '*/steamapps/downloading' -o -path '*/.local/share/Trash' -o -path '*/.Trash-*' \
+	   -o -path '*/.git' -o -path '*/node_modules' -o -path '*/proc' -o -path '*/lost+found' \
+	   -o -path '*/romfs' -o -path '*/exefs' \) -prune \
+	-o -type f \( -false "${NAMES[@]}" \) -print 2>/dev/null | sort -u)
+
+declare -A ROOT=()
+NFOUND=0; SKIPPED=0
+for gm in "${GAMES[@]}"; do
+	id=$(field "$gm" 1); name=$(field "$gm" 2); sig=$(field "$gm" 3); mode=$(field "$gm" 4); pat=$(field "$gm" 5)
+	cands=()
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		case "$(basename "$f")" in $sig) ;; *) continue ;; esac
+		d=$(dirname "$f")
+		if [ "$mode" = slotparent ]; then case "$(basename "$d")" in save_[0-9]*) d=$(dirname "$d") ;; *) continue ;; esac; fi
+		cands+=("$d")
+	done <<< "$FOUND"
+	mapfile -t cands < <(printf '%s\n' "${cands[@]-}" | sed '/^$/d' | sort -u)   # unique, safe with spaces
+
+	remembered=$(path_get "$id"); [ $PICK_AGAIN = 1 ] && remembered=""
+	chosen=""
+	if [ ${#cands[@]} -eq 0 ]; then
+		if [ -n "$remembered" ] && [ -d "$remembered" ]; then chosen="$remembered"   # folder exists, saves were deleted
+		else skip "$name: no save files found on this device — skipping it. (Play it once and save, then run again.)"; continue; fi
+	elif [ ${#cands[@]} -eq 1 ]; then
+		chosen="${cands[0]}"
+	else
+		for c in "${cands[@]}"; do [ "$c" = "$remembered" ] && chosen="$c"; done
+		if [ -z "$chosen" ]; then
+			warn "$name: found saves in ${#cands[@]} places:"
+			i=1; for c in "${cands[@]}"; do printf '      %d) %s  (last saved %s)\n' $i "$c" "$(newest "$c" "$pat")"; i=$((i+1)); done
+			if ask "      Which one is the real one? [1-${#cands[@]}, Enter = skip this game]: " && [[ "$REPLY" =~ ^[0-9]+$ ]] && [ "$REPLY" -ge 1 ] && [ "$REPLY" -le ${#cands[@]} ]; then
+				chosen="${cands[$((REPLY-1))]}"
+			else skip "$name: skipped (no location chosen)."; continue; fi
+		else
+			say "  · $name: using $chosen (also found $(( ${#cands[@]} - 1 )) other location(s); run with --pick-again to change)"
+		fi
+	fi
+	[ $DRY = 1 ] || path_set "$id" "$chosen"
+	ROOT[$id]="$chosen"; NFOUND=$((NFOUND+1))
+	ok "$name: $chosen"
+done
+[ $NFOUND -gt 0 ] || die "No save files found for any of the games on this device. Play one and save first."
+
+# ---------- decide ----------
+say ""
+say "Comparing with the cloud…"
+UPLOAD=(); DOWNLOAD=()
+PROCS=$(running_programs)
+for gm in "${GAMES[@]}"; do
+	id=$(field "$gm" 1); name=$(field "$gm" 2); pat=$(field "$gm" 5); procs=$(field "$gm" 6)
+	[ -n "${ROOT[$id]-}" ] || continue
+	root="${ROOT[$id]}"; cdir="$REPO/games/$id"
+	L=$(hash_dir "$root" "$pat"); Cl=$(hash_dir "$cdir" "$pat"); Bs=$(state_get "$id")
+	cinfo=""; [ -f "$REPO/games/$id.info" ] && cinfo=$(sed -n 's/^saved=//p' "$REPO/games/$id.info")" on "$(sed -n 's/^device=//p' "$REPO/games/$id.info")
+
+	if grep -qE "$procs" <<< "$PROCS"; then skip "$name is running right now — close it first. Skipped."; continue; fi
+	if [ "$(size_kb "$root")" -gt 102400 ]; then skip "$name: save folder is over 100 MB, that's not normal. Skipped."; continue; fi
+
+	if [ "$L" = "$Cl" ]; then
+		[ "$L" = none ] && { skip "$name: no saves here or in the cloud yet."; continue; }
+		ok "$name: up to date"; [ $DRY = 1 ] || state_set "$id" "$L"; continue
+	fi
+	if [ "$L" = none ]; then decision=down
+	elif [ "$Cl" = none ]; then decision=up
+	elif [ "$Bs" = "$Cl" ]; then decision=up
+	elif [ "$Bs" = "$L" ]; then decision=down
+	else
+		warn "$name: changed both here and in the cloud since the last sync on this device."
+		printf '      this device: last saved %s\n      cloud:       last saved %s\n' "$(newest "$root" "$pat")" "${cinfo:-unknown}"
+		if ask "      Keep which one? [h = this device / c = cloud / Enter = skip]: "; then
+			case "$REPLY" in h|H) decision=up ;; c|C) decision=down ;; *) skip "$name: skipped."; continue ;; esac
+		else skip "$name: skipped (needs a decision; run zsync in a terminal)."; continue; fi
+	fi
+	if [ "$decision" = up ]; then act "$name: this device is newer ($(newest "$root" "$pat")) → upload to cloud"; UPLOAD+=("$id")
+	else act "$name: cloud is newer (${cinfo:-unknown}) → download to this device"; DOWNLOAD+=("$id"); fi
+done
+
+SKIPNOTE=""; [ $SKIPPED -gt 0 ] && SKIPNOTE=" ${Y}${B}$SKIPPED game(s) were skipped — see the ⚠ lines above.${N}"
+if [ $DRY = 1 ]; then say ""; say "${Y}Dry run: nothing was changed.${N}$SKIPNOTE"; exit 0; fi
+if [ ${#UPLOAD[@]} -eq 0 ] && [ ${#DOWNLOAD[@]} -eq 0 ]; then
+	say ""
+	if [ $SKIPPED -eq 0 ]; then say "${G}${B}Everything is in sync.${N}"; exit 0
+	else say "Nothing was transferred.$SKIPNOTE"; exit 2; fi
+fi
+
+# ---------- downloads (cloud -> this device) ----------
+FAILED=0
+for id in "${DOWNLOAD[@]-}"; do
+	[ -n "$id" ] || continue
+	for gm in "${GAMES[@]}"; do [ "$(field "$gm" 1)" = "$id" ] && { name=$(field "$gm" 2); pat=$(field "$gm" 5); }; done
+	root="${ROOT[$id]}"; cdir="$REPO/games/$id"; want=$(hash_dir "$cdir" "$pat")
+	bk=""
+	if [ "$(count_files "$root" "$pat")" -gt 0 ]; then
+		bk=$(backup_local "$id" "$root" "$pat") || { err "$name: couldn't back up the current save, so I didn't touch it."; FAILED=1; continue; }
+	fi
+	# replace only the save files: remove local ones the cloud doesn't have, copy the cloud's in
+	(cd "$root" && find . -type f -name "$pat" ! -name '.*' -print0) | while IFS= read -r -d '' f; do
+		[ -e "$cdir/$f" ] || rm -f "$root/$f"
+	done
+	(cd "$cdir" && find . -type f -name "$pat" ! -name '.*' -print0 | tar --null -cf - -T -) | (cd "$root" && tar -xpf -)
+	sync -f "$root" 2>/dev/null || sync
+	if [ "$(hash_dir "$root" "$pat")" = "$want" ]; then
+		state_set "$id" "$want"; ok "$name: downloaded${bk:+ (old save backed up: $bk)}"
+	else
+		err "$name: download didn't check out — putting the old save back."
+		[ -n "$bk" ] && (cd "$root" && tar -xzf "$bk")
+		FAILED=1
+	fi
+done
+
+# ---------- uploads (this device -> cloud) ----------
+if [ ${#UPLOAD[@]} -gt 0 ]; then
+	for id in "${UPLOAD[@]}"; do
+		for gm in "${GAMES[@]}"; do [ "$(field "$gm" 1)" = "$id" ] && { name=$(field "$gm" 2); pat=$(field "$gm" 5); }; done
+		root="${ROOT[$id]}"; cdir="$REPO/games/$id"
+		rm -rf "$cdir"; mkdir -p "$cdir"
+		(cd "$root" && find . -type f -name "$pat" ! -name '.*' -print0 | tar --null -cf - -T -) | (cd "$cdir" && tar -xf -)
+		printf 'game=%s\nsaved=%s\ndevice=%s\nhash=%s\n' "$name" "$(newest "$root" "$pat")" "$DEVICE" "$(hash_dir "$cdir" "$pat")" > "$REPO/games/$id.info"
+	done
+	g add -A games >/dev/null 2>&1
+	if g commit -q -m "$(printf 'Sync from %s: %s' "$DEVICE" "${UPLOAD[*]}")" && g push -q origin main 2>/dev/null; then
+		for id in "${UPLOAD[@]}"; do
+			for gm in "${GAMES[@]}"; do [ "$(field "$gm" 1)" = "$id" ] && { name=$(field "$gm" 2); pat=$(field "$gm" 5); }; done
+			state_set "$id" "$(hash_dir "$REPO/games/$id" "$pat")"; ok "$name: uploaded"
+		done
+	else
+		err "Upload failed (the cloud may have changed during this sync, or the connection dropped)."
+		err "Your saves on this device are untouched. Just run zsync again."
+		rm -rf "$REPO"; FAILED=1   # it's only a cache of the cloud; it is downloaded fresh next run
+	fi
+fi
+
+say ""
+if [ $FAILED = 1 ]; then say "${Y}${B}Sync finished with problems — see above. Nothing was lost.${N}$SKIPNOTE"; exit 1
+elif [ $SKIPPED -gt 0 ]; then say "${G}${B}Sync complete for the rest.${N}$SKIPNOTE"; exit 2
+else say "${G}${B}Sync complete.${N}"; fi
