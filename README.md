@@ -49,6 +49,8 @@ Local backups: `~/.local/share/zelda-sync/backups/` (the newest 20 per game). Th
 - `--dry-run` shows what would happen and changes nothing
 - `--pick-again` forgets the remembered save locations and asks again
 - `--yes` skips the confirmation question (for unattended use)
+- `--diagnose` searches the device for anything related to these games and uploads a report to the private
+  saves repo (`diagnostics/`). It touches no saves.
 
 The GitHub token is read from `~/Games/Zelda/.sync/token` or `~/.config/zelda-sync/token`; on a new device it
 asks for it once.

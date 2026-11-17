@@ -8,6 +8,7 @@
 #   --dry-run       show what would happen, change nothing
 #   --pick-again    forget remembered save locations and choose again
 #   --yes           don't ask for confirmation (for unattended use)
+#   --diagnose      search this device for anything Zelda-related and upload a report (touches no saves)
 #   --help
 #
 # Games: Skyward Sword HD (Sky Recomp), Ocarina of Time (Ship of Harkinian), Majora's Mask
@@ -26,7 +27,7 @@ set -u -o pipefail
 
 OWNER="DannyDev93"
 SAVES_REPO="zelda-saves"
-VERSION="1.1"
+VERSION="1.2"
 
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/zelda-sync"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zelda-sync"
@@ -45,6 +46,7 @@ REMOTE="https://github.com/$OWNER/$SAVES_REPO.git"
 TEST_REMOTE="${ZSYNC_TEST_REMOTE:-}"   # for testing only: a local git repo used instead of GitHub
 DRY=0
 YES=0
+DIAG=0
 PICK_AGAIN=0
 
 # ---------- output ----------
@@ -121,6 +123,7 @@ for a in "$@"; do case "$a" in
 	--dry-run|-n) DRY=1 ;;
 	--pick-again) PICK_AGAIN=1 ;;
 	--yes|-y) YES=1 ;;
+	--diagnose) DIAG=1 ;;
 	-h|--help) sed -n '2,24p' "$0" 2>/dev/null || say "zsync: --dry-run, --pick-again"; exit 0 ;;
 	*) die "Unknown option: $a (use --dry-run or --pick-again)" ;;
 esac; done
@@ -181,6 +184,48 @@ else
 fi
 ok "connected to the cloud ($([ -n "$TEST_REMOTE" ] && echo "TEST: $TEST_REMOTE" || echo "$OWNER/$SAVES_REPO"))"
 
+# ---------- --diagnose: report what's on this device, upload it, touch no saves ----------
+if [ $DIAG = 1 ]; then
+	say ""
+	say "Diagnose mode: searching this device (this can take a minute)…"
+	stamp=$(date '+%Y%m%d-%H%M%S'); safe=$(printf '%s' "$DEVICE" | tr -c 'A-Za-z0-9._-' '_')
+	rel="diagnostics/$safe-$stamp.txt"; out="$REPO/$rel"; mkdir -p "$REPO/diagnostics"
+	droots=("$HOME"); for m in /run/media/*/* /run/media/* /media/* /mnt/*; do [ -d "$m" ] && [ -r "$m" ] && case "$m" in "$HOME"*) ;; *) droots+=("$m") ;; esac; done
+	{
+		echo "zsync $VERSION diagnose report"
+		echo "device: $DEVICE   product: $PRODUCT   user: $(id -un)   home: $HOME   date: $(date)"
+		grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release 2>/dev/null
+		echo "searched: ${droots[*]}"
+		echo
+		echo "== remembered save locations (~/.config/zelda-sync/paths)"; cat "$PATHS" 2>/dev/null || echo "(none)"
+		echo
+		echo "== flatpak apps that look related"
+		flatpak list --app --columns=application,version 2>/dev/null | grep -iE 'zelda|recomp|harkinian|soh|dusk|twilit|wwhd|wind|sky|dolphin|cemu|emudeck|ryujinx|yuzu|eden|citron' || echo "(none / flatpak not available)"
+		echo
+		echo "== game programs and folders (name matches)"
+		find "${droots[@]}" \( -path '*/.cache' -o -path '*/steamapps/shadercache' -o -path '*/.local/share/Trash' -o -path '*/.git' -o -path "$DATA" -o -path '*/romfs' -o -path '*/exefs' -o -path '*/proc' -o -path '*/flatpak/app' -o -path '*/flatpak/runtime' -o -path '*/flatpak/repo' -o -path '*/zelda-sync/repo' -o -path '*/zelda-sync/backups' \) -prune -o \
+			\( -iname '*zelda64*' -o -iname '*recomp*' -o -iname '*harkinian*' -o -iname 'soh' -o -iname 'soh.*' -o -iname '*dusklight*' -o -iname '*twilit*' \
+			   -o -iname 'wwhd' -o -iname '*windwaker*' -o -iname '*wind-waker*' -o -iname '*skyrecomp*' -o -iname 'TwilitRealm' \) -print 2>/dev/null | grep -viE 'shader|pipeline|/cache/' | head -200
+		echo
+		echo "== possible save files (with size and date)"
+		find "${droots[@]}" \( -path '*/.cache' -o -path '*/steamapps/common' -o -path '*/steamapps/shadercache' -o -path '*/.local/share/Trash' -o -path '*/.git' -o -path "$DATA" -o -path '*/romfs' -o -path '*/exefs' -o -path '*/proc' -o -path '*/flatpak/app' -o -path '*/flatpak/runtime' -o -path '*/flatpak/repo' -o -path '*/zelda-sync/repo' -o -path '*/zelda-sync/backups' \) -prune -o \
+			-type f \( -iname '*gczelda*' -o -iname '*GZ2*' -o -iname '*RZD*' -o -iname 'mm.n64*' -o -iname '*.n64.*.bin' -o -iname 'wiiking*' -o -iname 'cking.sav' \
+			   -o -iname 'global.sav' -o -iname 'file[0-9].sav' -o -iname '*.gci' -o -iname 'MemoryCard*.raw' -o -iname '*.raw' -path '*emory*' \
+			   -o \( -iname '*.sav' -o -iname '*.bin' -o -iname '*.dat' -o -iname '*.json' \) \( -ipath '*zelda64*' -o -ipath '*twilit*' -o -ipath '*dusk*' -o -ipath '*soh*' -o -ipath '*harkinian*' -o -ipath '*wwhd*' -o -ipath '*skyrecomp*' \) \) \
+			-printf '%TY-%Tm-%Td %TH:%TM  %10s  %p\n' 2>/dev/null | grep -viE 'shader|pipeline|/cache/|controllerdb|gamecontrollerdb|cking_pic' | sort -k4 | head -400
+		echo
+	} > "$out" 2>&1
+	n=$(grep -c . "$out")
+	git -C "$REPO" add "$rel" >/dev/null 2>&1
+	if g commit -q -m "Diagnose report from $DEVICE" && g push -q origin main 2>/dev/null; then
+		say ""; ok "report uploaded ($n lines): GitHub $OWNER/$SAVES_REPO → $rel"
+		say "     Nothing else was changed. Tell Claude it's there."
+		exit 0
+	else
+		rm -rf "$REPO"; die "Couldn't upload the report. The report is not lost: run --diagnose again."
+	fi
+fi
+
 # ---------- search for save files ----------
 say ""
 say "Looking for save files…"
@@ -191,7 +236,7 @@ done
 NAMES=()
 for gm in "${GAMES[@]}"; do NAMES+=(-o -name "$(field "$gm" 3)"); done
 FOUND=$(find "${ROOTS[@]}" \
-	\( -path "$DATA" -o -path "$HOME/Games/Zelda/_work" -o -path "$HOME/Games/Zelda/.sync" \
+	\( -path "$DATA" -o -path '*/zelda-sync/repo' -o -path '*/zelda-sync/backups' -o -path "$HOME/Games/Zelda/_work" -o -path "$HOME/Games/Zelda/.sync" \
 	   -o -path '*/.cache' -o -path '*/steamapps/common' -o -path '*/steamapps/shadercache' \
 	   -o -path '*/steamapps/downloading' -o -path '*/.local/share/Trash' -o -path '*/.Trash-*' \
 	   -o -path '*/.git' -o -path '*/node_modules' -o -path '*/proc' -o -path '*/lost+found' \
