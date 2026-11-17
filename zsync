@@ -27,7 +27,7 @@ set -u -o pipefail
 
 OWNER="DannyDev93"
 SAVES_REPO="zelda-saves"
-VERSION="1.3"
+VERSION="1.4"
 
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/zelda-sync"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zelda-sync"
@@ -71,7 +71,7 @@ ask() { # ask "question" -> reply in $REPLY ; returns 1 when there is no termina
 GAMES=(
 "ss;Skyward Sword HD;wiiking2.sav;slotparent;*;^(skyrecomp|sky.?recomp.*\\.appimage)$"
 "soh;Ocarina of Time (Ship of Harkinian);global.sav;dir;*;^(soh\\.elf|soh|soh.*\\.appimage)$"
-"mm;Majora's Mask (2 Ship 2 Harkinian);global.json;twoship;*.json;^(2ship|2ship.*\\.appimage)$"
+"mm;Majora's Mask (2 Ship 2 Harkinian);file[123].json;twoship;*.json;^(2ship|2ship.*\\.appimage)$"
 "tp;Twilight Princess (Dusklight, GameCube version);*-GZ2?-gczelda2.gci;dir;*-GZ2?-gczelda2.gci;^(dusklight|dusklight.*\\.appimage)$"
 "ww;Wind Waker HD (ZeldaWWHDRecomp);cking.sav;dir;*;^(wind-waker-hd|wwhd|windwakerhd.*\\.appimage)$"
 )
@@ -90,7 +90,7 @@ field() { local IFS=';' F; read -r -a F <<< "$1"; printf '%s' "${F[$(( $2 - 1 ))
 valid_root() { # valid_root mode dir : is this folder really this game's save folder?
 	[ -d "$2" ] || return 1
 	case "$1" in
-		twoship) [ "$(basename "$2")" = saves ] && [ -f "$(dirname "$2")/2ship2harkinian.json" ] ;;
+		twoship) grep -qsE '"(newCycleSave|owlSave)"' "$2"/file[123].json ;;
 		slotparent) compgen -G "$2/save_[0-9]*" >/dev/null ;;
 		*) true ;;
 	esac
@@ -222,6 +222,43 @@ if [ $DIAG = 1 ]; then
 			   -o \( -iname '*.sav' -o -iname '*.bin' -o -iname '*.dat' -o -iname '*.json' \) \( -ipath '*zelda64*' -o -ipath '*twilit*' -o -ipath '*dusk*' -o -ipath '*soh*' -o -ipath '*harkinian*' -o -ipath '*wwhd*' -o -ipath '*skyrecomp*' \) \) \
 			-printf '%TY-%Tm-%Td %TH:%TM  %10s  %p\n' 2>/dev/null | grep -viE 'shader|pipeline|/cache/|controllerdb|gamecontrollerdb|cking_pic' | sort -k4 | head -400
 		echo
+		PRUNE=( \( -path '*/.cache' -o -path '*/steamapps/common' -o -path '*/steamapps/shadercache' -o -path '*/.local/share/Trash' -o -path '*/.git' -o -path "$DATA"
+			-o -path '*/romfs' -o -path '*/exefs' -o -path '*/proc' -o -path '*/flatpak/app' -o -path '*/flatpak/runtime' -o -path '*/flatpak/repo'
+			-o -path '*/zelda-sync/repo' -o -path '*/zelda-sync/backups' -o -path '*/.var/app/org.mozilla*' -o -path '*/.mozilla' -o -path '*/.claude' -o -path '*/htmlcache'
+			-o -path '*/Steam/logs' -o -path '*/Steam/appcache' -o -path '*/Steam/depotcache' -o -path '*/steamapps/downloading' -o -path '*/compatdata/*/pfx/drive_c/windows' \) -prune -o )
+		echo "== every file changed in the last 3 days (newest first)"
+		find "${droots[@]}" "${PRUNE[@]}" -type f -mtime -3 -size -64M -printf '%TY-%Tm-%Td %TH:%TM  %10s  %p\n' 2>/dev/null \
+			| grep -viE 'shader|pipeline|/cache|\.log$|/logs/|baloo|recently-used|kwin|plasma|akonadi|\.lock$|/Trash/|thumbnails|kactivity|\.xbel|/state/|sessionstore|\.sqlite|zelda-sync/state|/fontconfig' \
+			| sort -r | head -300
+		echo
+		echo "== every folder called saves / save / Save, with its files"
+		find "${droots[@]}" "${PRUNE[@]}" -type d \( -iname saves -o -iname save -o -iname 'card a' -o -iname 'card b' \) -print 2>/dev/null | head -60 | while IFS= read -r d; do
+			echo "-- $d"; find "$d" -maxdepth 2 -type f -printf '   %TY-%Tm-%Td %TH:%TM  %10s  %P\n' 2>/dev/null | sort -r | head -25
+		done
+		echo
+		echo "== Dusklight / 2 Ship folders (contents)"
+		{ find "${droots[@]}" "${PRUNE[@]}" -type f -name '2ship2harkinian.json' -printf '%h\n' 2>/dev/null; find "${droots[@]}" "${PRUNE[@]}" -type d \( -iname 'TwilitRealm' -o -iname '2s2h' -o -iname '2ship*' \) -print 2>/dev/null; } | sort -u | head -20 | while IFS= read -r d; do
+			echo "-- $d"; find "$d" -maxdepth 4 \( -iname logs -o -iname mods -o -iname mod_data -o -iname sentry \) -prune -o -type f -printf '   %TY-%Tm-%Td %TH:%TM  %10s  %P\n' 2>/dev/null | sort -r | head -60
+		done
+		echo
+		echo "== files that are 2 Ship save files by their contents"
+		find "${droots[@]}" "${PRUNE[@]}" -type f -iname '*.json' -size -4M -print0 2>/dev/null | xargs -0r grep -lE '"(newCycleSave|owlSave)"' 2>/dev/null | head -40 | while IFS= read -r f; do stat -c '   %y  %10s  %n' "$f" | cut -c1-200; done
+		echo
+		echo "== Steam shortcuts for these games (how they are started)"
+		for f in "$HOME"/.local/share/Steam/userdata/*/config/shortcuts.vdf "$HOME"/.steam/steam/userdata/*/config/shortcuts.vdf; do
+			[ -f "$f" ] || continue; echo "-- $f"
+			tr -c '[:print:]' '\n' < "$f" | sed '/^$/d' | grep -i -B3 -A5 -E '2ship|dusk|harkinian|majora|twilight|zelda|sky|wind' | head -120
+		done
+		echo
+		echo "== those games running right now (program, folder it runs in, SHIP_HOME)"
+		for pr in /proc/[0-9]*; do
+			a=$(tr '\0' '\n' < "$pr/cmdline" 2>/dev/null | head -1)
+			case "${a,,}" in *2ship*|*dusklight*|*soh*|*skyrecomp*|*wwhd*|*wind-waker*) ;; *) continue ;; esac
+			printf '   pid %s  %s\n      runs in: %s   SHIP_HOME=%s\n' "${pr##*/}" "$a" "$(readlink "$pr/cwd" 2>/dev/null)" "$(tr '\0' '\n' < "$pr/environ" 2>/dev/null | sed -n 's/^SHIP_HOME=//p')"
+		done
+		echo
+		echo "== what zsync's normal search matches (raw)"
+		find "${droots[@]}" "${PRUNE[@]}" -type f \( -name 'wiiking2.sav' -o -name 'global.sav' -o -name 'file[123].json' -o -name 'global.json' -o -name '*gczelda2*.gci' -o -name 'cking.sav' \) -printf '   %TY-%Tm-%Td %TH:%TM  %p\n' 2>/dev/null | head -60
 	} > "$out" 2>&1
 	n=$(grep -c . "$out")
 	git -C "$REPO" add "$rel" >/dev/null 2>&1
@@ -262,7 +299,7 @@ for gm in "${GAMES[@]}"; do
 		case "$(basename "$f")" in $sig) ;; *) continue ;; esac
 		d=$(dirname "$f")
 		if [ "$mode" = slotparent ]; then case "$(basename "$d")" in save_[0-9]*) d=$(dirname "$d") ;; *) continue ;; esac; fi
-		if [ "$mode" = twoship ]; then [ "$(basename "$d")" = saves ] && [ -f "$(dirname "$d")/2ship2harkinian.json" ] || continue; fi
+		if [ "$mode" = twoship ]; then grep -qE '"(newCycleSave|owlSave)"' "$f" 2>/dev/null || continue; fi   # a 2 Ship save, by its contents
 		cands+=("$d")
 	done <<< "$FOUND"
 	mapfile -t cands < <(printf '%s\n' "${cands[@]-}" | sed '/^$/d' | sort -u)   # unique, safe with spaces
