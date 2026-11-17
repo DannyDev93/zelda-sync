@@ -87,6 +87,14 @@ running_programs() {
 field() { local IFS=';' F; read -r -a F <<< "$1"; printf '%s' "${F[$(( $2 - 1 ))]}"; }   # no glob expansion
 
 # ---------- helpers ----------
+valid_root() { # valid_root mode dir : is this folder really this game's save folder?
+	[ -d "$2" ] || return 1
+	case "$1" in
+		twoship) [ "$(basename "$2")" = saves ] && [ -f "$(dirname "$2")/2ship2harkinian.json" ] ;;
+		slotparent) compgen -G "$2/save_[0-9]*" >/dev/null ;;
+		*) true ;;
+	esac
+}
 need() { command -v "$1" >/dev/null 2>&1 || die "This needs '$1', which isn't installed."; }
 
 hash_dir() { # hash_dir dir pattern -> prints hash, or "none" when there are no files
@@ -262,7 +270,7 @@ for gm in "${GAMES[@]}"; do
 	remembered=$(path_get "$id"); [ $PICK_AGAIN = 1 ] && remembered=""
 	chosen=""
 	if [ ${#cands[@]} -eq 0 ]; then
-		if [ -n "$remembered" ] && [ -d "$remembered" ]; then chosen="$remembered"   # folder exists, saves were deleted
+		if [ -n "$remembered" ] && valid_root "$mode" "$remembered"; then chosen="$remembered"   # right kind of folder, saves were deleted
 		else skip "$name: no save files found on this device — skipping it. (Play it once and save, then run again.)"; continue; fi
 	elif [ ${#cands[@]} -eq 1 ]; then
 		chosen="${cands[0]}"
