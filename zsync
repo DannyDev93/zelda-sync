@@ -27,7 +27,7 @@ set -u -o pipefail
 
 OWNER="DannyDev93"
 SAVES_REPO="zelda-saves"
-VERSION="1.4"
+VERSION="1.4.1"
 
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/zelda-sync"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zelda-sync"
@@ -331,7 +331,8 @@ while IFS= read -r f; do
 	case "$(basename "$f")" in *-RZD?-gczelda2.gci)
 		warn "Twilight Princess: found a save from the Wii version: $f"
 		warn "   It is NOT synced and is left alone — only the GameCube version is (Wii and GameCube saves aren't compatible)."
-		warn "   To sync Twilight Princess, play the GameCube disc in Dusklight on every device." ;;
+		if [ -n "${ROOT[tp]-}" ]; then warn "   Your GameCube save (found above) is the one that gets synced."
+		else warn "   To sync Twilight Princess, play the GameCube disc in Dusklight on every device."; fi ;;
 	esac
 done <<< "$FOUND"
 [ $NFOUND -gt 0 ] || die "No save files found for any of the games on this device. Play one and save first."
