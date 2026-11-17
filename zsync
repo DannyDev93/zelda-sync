@@ -27,7 +27,7 @@ set -u -o pipefail
 
 OWNER="DannyDev93"
 SAVES_REPO="zelda-saves"
-VERSION="1.2"
+VERSION="1.3"
 
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/zelda-sync"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zelda-sync"
@@ -71,8 +71,8 @@ ask() { # ask "question" -> reply in $REPLY ; returns 1 when there is no termina
 GAMES=(
 "ss;Skyward Sword HD;wiiking2.sav;slotparent;*;^(skyrecomp|sky.?recomp.*\\.appimage)$"
 "soh;Ocarina of Time (Ship of Harkinian);global.sav;dir;*;^(soh\\.elf|soh|soh.*\\.appimage)$"
-"mm;Majora's Mask (Zelda64Recompiled);mm.n64.*.bin;dir;*;^zelda64recomp"
-"tp;Twilight Princess (Dusklight);*-GZ2?-gczelda2.gci;dir;*gczelda2*.gci;^(dusklight|dusklight.*\\.appimage)$"
+"mm;Majora's Mask (2 Ship 2 Harkinian);global.json;twoship;*.json;^(2ship|2ship.*\\.appimage)$"
+"tp;Twilight Princess (Dusklight, GameCube version);*-GZ2?-gczelda2.gci;dir;*-GZ2?-gczelda2.gci;^(dusklight|dusklight.*\\.appimage)$"
 "ww;Wind Waker HD (ZeldaWWHDRecomp);cking.sav;dir;*;^(wind-waker-hd|wwhd|windwakerhd.*\\.appimage)$"
 )
 # Names of running programs only (program file names, never their arguments), lower-case, one per line.
@@ -209,7 +209,7 @@ if [ $DIAG = 1 ]; then
 		echo
 		echo "== possible save files (with size and date)"
 		find "${droots[@]}" \( -path '*/.cache' -o -path '*/steamapps/common' -o -path '*/steamapps/shadercache' -o -path '*/.local/share/Trash' -o -path '*/.git' -o -path "$DATA" -o -path '*/romfs' -o -path '*/exefs' -o -path '*/proc' -o -path '*/flatpak/app' -o -path '*/flatpak/runtime' -o -path '*/flatpak/repo' -o -path '*/zelda-sync/repo' -o -path '*/zelda-sync/backups' \) -prune -o \
-			-type f \( -iname '*gczelda*' -o -iname '*GZ2*' -o -iname '*RZD*' -o -iname 'mm.n64*' -o -iname '*.n64.*.bin' -o -iname 'wiiking*' -o -iname 'cking.sav' \
+			-type f \( -iname '*gczelda*' -o -iname '*GZ2*' -o -iname '*RZD*' -o -iname 'mm.n64*' -o -iname '*.n64.*.bin' -o -iname 'wiiking*' -o -iname 'cking.sav' -o -iname '2ship2harkinian.json' -o \( -iname '*.json' -ipath '*/saves/*' \) \
 			   -o -iname 'global.sav' -o -iname 'file[0-9].sav' -o -iname '*.gci' -o -iname 'MemoryCard*.raw' -o -iname '*.raw' -path '*emory*' \
 			   -o \( -iname '*.sav' -o -iname '*.bin' -o -iname '*.dat' -o -iname '*.json' \) \( -ipath '*zelda64*' -o -ipath '*twilit*' -o -ipath '*dusk*' -o -ipath '*soh*' -o -ipath '*harkinian*' -o -ipath '*wwhd*' -o -ipath '*skyrecomp*' \) \) \
 			-printf '%TY-%Tm-%Td %TH:%TM  %10s  %p\n' 2>/dev/null | grep -viE 'shader|pipeline|/cache/|controllerdb|gamecontrollerdb|cking_pic' | sort -k4 | head -400
@@ -235,6 +235,7 @@ for m in /run/media/*/* /run/media/* /media/* /mnt/*; do
 done
 NAMES=()
 for gm in "${GAMES[@]}"; do NAMES+=(-o -name "$(field "$gm" 3)"); done
+NAMES+=(-o -name '*-RZD?-gczelda2.gci')   # Wii Twilight Princess: never synced, only warned about
 FOUND=$(find "${ROOTS[@]}" \
 	\( -path "$DATA" -o -path '*/zelda-sync/repo' -o -path '*/zelda-sync/backups' -o -path "$HOME/Games/Zelda/_work" -o -path "$HOME/Games/Zelda/.sync" \
 	   -o -path '*/.cache' -o -path '*/steamapps/common' -o -path '*/steamapps/shadercache' \
@@ -253,6 +254,7 @@ for gm in "${GAMES[@]}"; do
 		case "$(basename "$f")" in $sig) ;; *) continue ;; esac
 		d=$(dirname "$f")
 		if [ "$mode" = slotparent ]; then case "$(basename "$d")" in save_[0-9]*) d=$(dirname "$d") ;; *) continue ;; esac; fi
+		if [ "$mode" = twoship ]; then [ "$(basename "$d")" = saves ] && [ -f "$(dirname "$d")/2ship2harkinian.json" ] || continue; fi
 		cands+=("$d")
 	done <<< "$FOUND"
 	mapfile -t cands < <(printf '%s\n' "${cands[@]-}" | sed '/^$/d' | sort -u)   # unique, safe with spaces
@@ -280,6 +282,13 @@ for gm in "${GAMES[@]}"; do
 	ROOT[$id]="$chosen"; NFOUND=$((NFOUND+1))
 	ok "$name: $chosen"
 done
+while IFS= read -r f; do
+	case "$(basename "$f")" in *-RZD?-gczelda2.gci)
+		warn "Twilight Princess: found a save from the Wii version: $f"
+		warn "   It is NOT synced and is left alone — only the GameCube version is (Wii and GameCube saves aren't compatible)."
+		warn "   To sync Twilight Princess, play the GameCube disc in Dusklight on every device." ;;
+	esac
+done <<< "$FOUND"
 [ $NFOUND -gt 0 ] || die "No save files found for any of the games on this device. Play one and save first."
 
 # ---------- decide ----------

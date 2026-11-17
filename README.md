@@ -16,8 +16,8 @@ curl -fsSL https://raw.githubusercontent.com/DannyDev93/zelda-sync/main/zsync | 
 |---|---|---|
 | Skyward Sword HD | Sky Recomp | `skyrecomp/save` |
 | Ocarina of Time | Ship of Harkinian | `soh/Save` |
-| Majora's Mask | Zelda64Recompiled | `Zelda64Recompiled/saves` |
-| Twilight Princess | Dusklight | the `*-GZ2?-gczelda2.gci` memory card file only |
+| Majora's Mask | 2 Ship 2 Harkinian | `saves/` next to `2ship2harkinian.json` (`file1-3.json`, `global.json`) |
+| Twilight Princess | Dusklight, GameCube disc | the `*-GZ2?-gczelda2.gci` memory card file only (Wii-version saves are reported, never synced) |
 | Wind Waker HD | ZeldaWWHDRecomp | `wwhd/save/user` |
 
 Only real save files are synced: no settings and no save states.
